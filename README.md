@@ -1,5 +1,9 @@
 # esp-idf-lib/i2cdev
 
+[![Build examples](https://github.com/esp-idf-lib/i2cdev/actions/workflows//build.yml/badge.svg)](https://github.com/esp-idf-lib/i2cdev/actions/workflows//build.yml)
+[![Build docs](https://github.com/esp-idf-lib/i2cdev/actions/workflows//build-docs.yml/badge.svg)](https://github.com/esp-idf-lib/i2cdev/actions/workflows//build-docs.yml)
+[![Validation](https://github.com/esp-idf-lib/i2cdev/actions/workflows//validate-component.yml/badge.svg)](https://github.com/esp-idf-lib/i2cdev/actions/workflows//validate-component.yml)
+
 ESP-IDF I2C master thread-safe utilities.
 
 * [Documentation](https://esp-idf-lib.github.io/i2cdev/)
@@ -11,7 +15,7 @@ ESP-IDF I2C master thread-safe utilities.
 ## Installation
 
 ```sh
-idf.py add-dependency esp-idf-lib/i2cdev^2.0.0
+idf.py add-dependency esp-idf-lib/i2cdev
 ```
 
 ## Support
