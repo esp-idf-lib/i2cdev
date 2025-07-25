@@ -11,7 +11,7 @@ ESP-IDF I2C master thread-safe utilities.
 ## Installation
 
 ```sh
-idf.py add-dependency "esp-idf-lib/i2cdev^2.0.0
+idf.py add-dependency esp-idf-lib/i2cdev^2.0.0
 ```
 
 ## Support
