@@ -55,7 +55,8 @@
 
 // Define missing types for older ESP-IDF versions
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 2, 0)
-typedef enum {
+typedef enum
+{
     I2C_ADDR_BIT_LEN_7 = 0, /*!< I2C 7bit address for slave mode */
     I2C_ADDR_BIT_LEN_10,    /*!< I2C 10bit address for slave mode */
 } i2c_addr_bit_len_t;
@@ -110,7 +111,8 @@ extern "C" {
 /**
  * @brief I2C transaction type for legacy probe
  */
-typedef enum {
+typedef enum
+{
     I2C_DEV_WRITE = 0, /**< Write operation for probe */
     I2C_DEV_READ       /**< Read operation for probe */
 } i2c_dev_type_t;

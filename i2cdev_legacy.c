@@ -425,7 +425,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev)
     gpio_num_t sda_pin; // Effective SDA pin to be used
     gpio_num_t scl_pin; // Effective SCL pin to be used
 
-    if (dev->cfg.sda_io_num == (gpio_num_t)-1)
+    if (dev->cfg.sda_io_num == (gpio_num_t) -1)
     {
         sda_pin = (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SDA_PIN;
     }
@@ -434,7 +434,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev)
         sda_pin = dev->cfg.sda_io_num;
     }
 
-    if (dev->cfg.scl_io_num == (gpio_num_t)-1)
+    if (dev->cfg.scl_io_num == (gpio_num_t) -1)
     {
         scl_pin = (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SCL_PIN;
     }
@@ -460,10 +460,11 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev)
 
     // Initialize common fields
     i2c_config_t legacy_cfg = { .mode = I2C_MODE_MASTER,
-        .sda_io_num = sda_pin, // Use locally determined pins
-        .scl_io_num = scl_pin, // Use locally determined pins
-        .sda_pullup_en = dev->cfg.sda_pullup_en ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
-        .scl_pullup_en = dev->cfg.scl_pullup_en ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE };
+                                .sda_io_num = sda_pin, // Use locally determined pins
+                                .scl_io_num = scl_pin, // Use locally determined pins
+                                .sda_pullup_en = dev->cfg.sda_pullup_en ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+                                .scl_pullup_en = dev->cfg.scl_pullup_en ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE
+                              };
 
 #ifdef CONFIG_IDF_TARGET_ESP8266
     // ESP8266 uses clk_stretch_tick instead of master.clk_speed
@@ -637,7 +638,7 @@ esp_err_t i2c_dev_read(const i2c_dev_t *dev, const void *out_data, size_t out_si
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (dev->addr << 1) | 1, true); // Addr + Read bit (1)
         i2c_master_read(cmd, in_data, in_size,
-            I2C_MASTER_LAST_NACK); // NACK the last byte to signal end
+                        I2C_MASTER_LAST_NACK); // NACK the last byte to signal end
         i2c_master_stop(cmd);
 
         // Execute the command

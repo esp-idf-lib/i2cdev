@@ -346,8 +346,8 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
     if (!port_state->installed)
     {
         // Pin Selection Logic: Use device-specified pins, fallback to Kconfig defaults if -1
-        gpio_num_t sda_pin = (dev->cfg.sda_io_num == (gpio_num_t)-1) ? (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SDA_PIN : dev->cfg.sda_io_num;
-        gpio_num_t scl_pin = (dev->cfg.scl_io_num == (gpio_num_t)-1) ? (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SCL_PIN : dev->cfg.scl_io_num;
+        gpio_num_t sda_pin = (dev->cfg.sda_io_num == (gpio_num_t) -1) ? (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SDA_PIN : dev->cfg.sda_io_num;
+        gpio_num_t scl_pin = (dev->cfg.scl_io_num == (gpio_num_t) -1) ? (gpio_num_t)CONFIG_I2CDEV_DEFAULT_SCL_PIN : dev->cfg.scl_io_num;
 
         // Validate pins (basic check, gpio_is_valid_gpio could be used for more robust check)
         if (sda_pin < 0 || scl_pin < 0)
@@ -385,11 +385,12 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
 #endif
 
         ESP_LOGI(TAG,
-            "[Port %d] First initialization. Configuring bus with SDA=%d, SCL=%d (Pullups "
-            "SCL:%d SDA:%d)",
-            dev->port, sda_pin, scl_pin, scl_pullup, sda_pullup);
+                 "[Port %d] First initialization. Configuring bus with SDA=%d, SCL=%d (Pullups "
+                 "SCL:%d SDA:%d)",
+                 dev->port, sda_pin, scl_pin, scl_pullup, sda_pullup);
 
-        i2c_master_bus_config_t bus_config = {
+        i2c_master_bus_config_t bus_config =
+        {
             .i2c_port = dev->port,
             .sda_io_num = sda_pin,
             .scl_io_num = scl_pin,
@@ -424,15 +425,15 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
     {
         ESP_LOGV(TAG, "[Port %d] Port already installed (SDA=%d, SCL=%d, Handle: %p).", dev->port, port_state->sda_pin_current, port_state->scl_pin_current, port_state->bus_handle);
         // Pin Consistency Check: For subsequent devices, ensure pins match already-configured bus
-        gpio_num_t sda_desired = (dev->cfg.sda_io_num == (gpio_num_t)-1) ? (gpio_num_t)port_state->sda_pin_current : dev->cfg.sda_io_num;
-        gpio_num_t scl_desired = (dev->cfg.scl_io_num == (gpio_num_t)-1) ? (gpio_num_t)port_state->scl_pin_current : dev->cfg.scl_io_num;
+        gpio_num_t sda_desired = (dev->cfg.sda_io_num == (gpio_num_t) -1) ? (gpio_num_t)port_state->sda_pin_current : dev->cfg.sda_io_num;
+        gpio_num_t scl_desired = (dev->cfg.scl_io_num == (gpio_num_t) -1) ? (gpio_num_t)port_state->scl_pin_current : dev->cfg.scl_io_num;
 
         if (sda_desired != port_state->sda_pin_current || scl_desired != port_state->scl_pin_current)
         {
             ESP_LOGE(TAG,
-                "[Port %d] Pin mismatch for device 0x%02x! Bus on SDA=%d,SCL=%d. Device wants "
-                "SDA=%d,SCL=%d",
-                dev->port, dev->addr, port_state->sda_pin_current, port_state->scl_pin_current, sda_desired, scl_desired);
+                     "[Port %d] Pin mismatch for device 0x%02x! Bus on SDA=%d,SCL=%d. Device wants "
+                     "SDA=%d,SCL=%d",
+                     dev->port, dev->addr, port_state->sda_pin_current, port_state->scl_pin_current, sda_desired, scl_desired);
             res = ESP_ERR_INVALID_STATE; // Cannot change pins for an installed bus
         }
         else
@@ -468,9 +469,9 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
     // 7-bit. Modified to conditionally check for I2C_ADDR_BIT_LEN_10 based on hardware support
     if (dev->addr_bit_len != I2C_ADDR_BIT_LEN_7
 #if SOC_I2C_SUPPORT_10BIT_ADDR
-        && dev->addr_bit_len != I2C_ADDR_BIT_LEN_10
+            && dev->addr_bit_len != I2C_ADDR_BIT_LEN_10
 #endif
-    )
+       )
     {
         ESP_LOGD(TAG, "[0x%02x at %d] addr_bit_len not explicitly set, defaulting to 7-bit.", dev->addr, dev->port);
         dev->addr_bit_len = I2C_ADDR_BIT_LEN_7;
@@ -480,9 +481,9 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
     if (dev->addr_bit_len == I2C_ADDR_BIT_LEN_7 && dev->addr > 0x7F)
     {
         ESP_LOGW(TAG,
-            "[0x%02x at %d] Device address > 0x7F but addr_bit_len is 7-bit. Ensure address "
-            "is correct.",
-            dev->addr, dev->port);
+                 "[0x%02x at %d] Device address > 0x7F but addr_bit_len is 7-bit. Ensure address "
+                 "is correct.",
+                 dev->addr, dev->port);
     }
 
 #if !defined(SOC_I2C_SUPPORT_10BIT_ADDR) || !SOC_I2C_SUPPORT_10BIT_ADDR
@@ -516,13 +517,14 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
         if (effective_dev_speed == 0)
         {
             ESP_LOGW(TAG,
-                "[0x%02x at %d] Device speed (dev->cfg.master.clk_speed) is 0, using default: "
-                "%" PRIu32 " Hz",
-                dev->addr, dev->port, (uint32_t)I2C_DEFAULT_FREQ_HZ);
+                     "[0x%02x at %d] Device speed (dev->cfg.master.clk_speed) is 0, using default: "
+                     "%" PRIu32 " Hz",
+                     dev->addr, dev->port, (uint32_t)I2C_DEFAULT_FREQ_HZ);
             effective_dev_speed = I2C_DEFAULT_FREQ_HZ;
         }
 
-        i2c_device_config_t dev_config = {
+        i2c_device_config_t dev_config =
+        {
             // Use the possibly modified addr_bit_len that respects hardware capabilities
             .dev_addr_length = dev->addr_bit_len,
             .device_address = dev->addr,
@@ -558,7 +560,7 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
 
 // Helper function with retry mechanism for I2C operations
 static esp_err_t i2c_do_operation_with_retry(i2c_dev_t *dev, esp_err_t (*i2c_func)(i2c_master_dev_handle_t, const void *, size_t, void *, size_t, int), const void *write_buffer, size_t write_size,
-    void *read_buffer, size_t read_size)
+                                             void *read_buffer, size_t read_size)
 {
     if (!dev)
         return ESP_ERR_INVALID_ARG;
@@ -584,9 +586,9 @@ static esp_err_t i2c_do_operation_with_retry(i2c_dev_t *dev, esp_err_t (*i2c_fun
         if (!dev->dev_handle)
         {
             ESP_LOGE(TAG,
-                "[0x%02x at %d] Device handle is NULL after setup (Try %d)! Cannot perform "
-                "operation.",
-                dev->addr, dev->port, retry);
+                     "[0x%02x at %d] Device handle is NULL after setup (Try %d)! Cannot perform "
+                     "operation.",
+                     dev->addr, dev->port, retry);
             // This indicates a persistent problem with adding the device to the bus.
             // No point retrying the i2c_func if handle is null.
             res = ESP_ERR_INVALID_STATE;
@@ -679,7 +681,7 @@ esp_err_t i2c_dev_read(const i2c_dev_t *dev, const void *out_data, size_t out_si
     ESP_LOGV(TAG, "[0x%02x at %d] i2c_dev_read called (out_size: %u, in_size: %u)", dev->addr, dev->port, out_size, in_size);
 
     esp_err_t result = i2c_do_operation_with_retry((i2c_dev_t *)dev, // Cast to non-const for i2c_setup_device internal modifications
-        out_data && out_size ? i2c_master_transmit_receive_wrapper : i2c_master_receive_wrapper, out_data, out_size, in_data, in_size);
+                                                   out_data && out_size ? i2c_master_transmit_receive_wrapper : i2c_master_receive_wrapper, out_data, out_size, in_data, in_size);
 
     ESP_LOGV(TAG, "[0x%02x at %d] i2c_dev_read result: %s (%d)", dev->addr, dev->port, esp_err_to_name(result), result);
     return result;
@@ -708,7 +710,8 @@ esp_err_t i2c_dev_write(const i2c_dev_t *dev, const void *out_reg, size_t out_re
 
         // Use stack for small buffers to avoid heap fragmentation
         if (total_write_size <= I2CDEV_MAX_STACK_ALLOC_SIZE)
-        { // Use stack allocation for small buffers
+        {
+            // Use stack allocation for small buffers
             uint8_t stack_buf[I2CDEV_MAX_STACK_ALLOC_SIZE];
             memcpy(stack_buf, out_reg, out_reg_size);
             memcpy(stack_buf + out_reg_size, out_data, out_size);
