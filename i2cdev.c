@@ -199,7 +199,8 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
         if (dev->port >= I2C_NUM_MAX)
         {
             ESP_LOGE(TAG, "[0x%02x at %d] Invalid port %d, skipping port-scoped cleanup", dev->addr, dev->port, dev->port);
-        } else
+        }
+        else
         {
             ESP_LOGW(TAG, "[0x%02x at %d] I2C subsystem not initialized, skipping port-scoped cleanup", dev->addr, dev->port);
         }
