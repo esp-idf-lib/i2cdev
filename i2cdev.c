@@ -88,25 +88,6 @@ static esp_err_t register_device(i2c_dev_t *dev)
     return ESP_ERR_NO_MEM;
 }
 
-// Helper to deregister a device
-static void deregister_device(i2c_dev_t *dev)
-{
-    if (!dev)
-        return;
-    int port = dev->port;
-    if (port >= I2C_NUM_MAX)
-        return;
-    for (int i = 0; i < CONFIG_I2CDEV_MAX_DEVICES_PER_PORT; i++)
-    {
-        if (active_devices[port][i] == dev)
-        {
-            active_devices[port][i] = NULL;
-            ESP_LOGV(TAG, "[0x%02x at %d] Deregistered device from slot %d", dev->addr, port, i);
-            return;
-        }
-    }
-}
-
 esp_err_t i2cdev_init(void)
 {
     ESP_LOGV(TAG, "Initializing I2C subsystem...");
@@ -210,72 +191,95 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
 
     ESP_LOGV(TAG, "[0x%02x at %d] Deleting device mutex and cleaning up resources", dev->addr, dev->port);
 
-    // Remove device from bus if handle exists
-    if (dev->dev_handle)
+    // If we cannot safely touch the port state (bad port index, or the
+    // subsystem was never initialized), there is no bus handle to release
+    // and no ref_count to decrement. Just drop the device mutex.
+    if (dev->port >= I2C_NUM_MAX || !i2c_ports[dev->port].lock)
+    {
+        if (dev->port >= I2C_NUM_MAX)
+        {
+            ESP_LOGE(TAG, "[0x%02x at %d] Invalid port %d, skipping port-scoped cleanup", dev->addr, dev->port, dev->port);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "[0x%02x at %d] I2C subsystem not initialized, skipping port-scoped cleanup", dev->addr, dev->port);
+        }
+        if (dev->mutex)
+        {
+            vSemaphoreDelete(dev->mutex);
+            dev->mutex = NULL;
+        }
+        return ESP_OK;
+    }
+
+    i2c_port_state_t *port_state = &i2c_ports[dev->port];
+
+    // Take the port mutex once and run the whole cleanup under it.
+    if (xSemaphoreTake(port_state->lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "[0x%02x at %d] Could not take port mutex for cleanup", dev->addr, dev->port);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    // Capture whether this device was actually added to the bus before
+    // we clear the field.
+    bool was_on_bus = (dev->dev_handle != NULL);
+
+    // 1) Remove the device from the bus, if it was added
+    if (was_on_bus)
     {
         ESP_LOGV(TAG, "[0x%02x at %d] Removing device handle %p from bus", dev->addr, dev->port, dev->dev_handle);
         esp_err_t rm_res = i2c_master_bus_rm_device((i2c_master_dev_handle_t)dev->dev_handle);
         if (rm_res != ESP_OK)
         {
             ESP_LOGW(TAG, "[0x%02x at %d] Failed to remove device handle: %s", dev->addr, dev->port, esp_err_to_name(rm_res));
-            // Continue with cleanup despite error
         }
         dev->dev_handle = NULL;
     }
 
-    // Deregister the device
-    deregister_device(dev);
-
-    // Update port reference count if port is valid
-    if (dev->port < I2C_NUM_MAX)
+    // 2) Deregister from active_devices[] under the same port mutex
+    for (int i = 0; i < CONFIG_I2CDEV_MAX_DEVICES_PER_PORT; i++)
     {
-        // Check if port mutex is initialized
-        if (!i2c_ports[dev->port].lock)
+        if (active_devices[dev->port][i] == dev)
         {
-            ESP_LOGW(TAG, "[0x%02x at %d] Port mutex not initialized, skipping ref_count update", dev->addr, dev->port);
-            // Continue with cleanup - just skip the mutex-protected section
-        }
-        else if (xSemaphoreTake(i2c_ports[dev->port].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) == pdTRUE)
-        {
-            // Only decrement ref_count if THIS device was actually added to the bus
-            if (i2c_ports[dev->port].installed && i2c_ports[dev->port].ref_count > 0 && dev->dev_handle != NULL)
-            {
-                i2c_ports[dev->port].ref_count--;
-                ESP_LOGV(TAG, "[Port %d] Decremented ref_count to %" PRIu32, dev->port, i2c_ports[dev->port].ref_count);
-
-                // If last device on this port, delete the bus
-                if (i2c_ports[dev->port].ref_count == 0)
-                {
-                    ESP_LOGI(TAG, "[Port %d] Last device removed, cleaning up THIS port's bus", dev->port);
-                    // Just clean up this port's bus
-                    if (i2c_ports[dev->port].bus_handle)
-                    {
-                        ESP_LOGI(TAG, "[Port %d] Deleting bus handle %p", dev->port, i2c_ports[dev->port].bus_handle);
-                        esp_err_t del_bus_res = i2c_del_master_bus(i2c_ports[dev->port].bus_handle);
-                        if (del_bus_res != ESP_OK)
-                        {
-                            ESP_LOGE(TAG, "[Port %d] Failed to delete master bus: %s", dev->port, esp_err_to_name(del_bus_res));
-                        }
-                        i2c_ports[dev->port].bus_handle = NULL;
-                    }
-                    i2c_ports[dev->port].installed = false;
-                    i2c_ports[dev->port].sda_pin_current = -1;
-                    i2c_ports[dev->port].scl_pin_current = -1;
-                }
-            }
-            else if (dev->dev_handle == NULL)
-            {
-                ESP_LOGV(TAG, "[0x%02x at %d] Device was never added to bus, skipping ref_count decrement", dev->addr, dev->port);
-            }
-            xSemaphoreGive(i2c_ports[dev->port].lock);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "[0x%02x at %d] Could not take port mutex for ref_count update", dev->addr, dev->port);
+            active_devices[dev->port][i] = NULL;
+            ESP_LOGV(TAG, "[0x%02x at %d] Deregistered device from slot %d", dev->addr, dev->port, i);
+            break;
         }
     }
 
-    // Delete the mutex itself last
+    // 3) Decrement ref_count; delete the bus if this was the last device
+    if (was_on_bus && port_state->installed && port_state->ref_count > 0)
+    {
+        port_state->ref_count--;
+        ESP_LOGV(TAG, "[Port %d] Decremented ref_count to %" PRIu32, dev->port, port_state->ref_count);
+
+        if (port_state->ref_count == 0)
+        {
+            ESP_LOGI(TAG, "[Port %d] Last device removed, cleaning up port's bus", dev->port);
+            if (port_state->bus_handle)
+            {
+                ESP_LOGI(TAG, "[Port %d] Deleting bus handle %p", dev->port, port_state->bus_handle);
+                esp_err_t del_bus_res = i2c_del_master_bus(port_state->bus_handle);
+                if (del_bus_res != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "[Port %d] Failed to delete master bus: %s", dev->port, esp_err_to_name(del_bus_res));
+                }
+                port_state->bus_handle = NULL;
+            }
+            port_state->installed = false;
+            port_state->sda_pin_current = -1;
+            port_state->scl_pin_current = -1;
+        }
+    }
+    else if (!was_on_bus)
+    {
+        ESP_LOGV(TAG, "[0x%02x at %d] Device was never added to bus, skipping ref_count decrement", dev->addr, dev->port);
+    }
+
+    xSemaphoreGive(port_state->lock);
+
+    // 4) Finally, drop the per-device mutex
     if (dev->mutex)
     {
         vSemaphoreDelete(dev->mutex);
