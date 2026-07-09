@@ -423,12 +423,22 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
             .i2c_port = dev->port,
             .sda_io_num = sda_pin,
             .scl_io_num = scl_pin,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
             .glitch_ignore_cnt = 7,
             .flags.enable_internal_pullup = (sda_pullup || scl_pullup),
             // Bus speed is not set here. It's per-device or a global target for the bus can be set
             // if desired, but i2c_master supports per-device speeds.
         };
+        // LP_I2C requires LP_I2C_SCLK_DEFAULT; HP I2C uses the standard default.
+        // clk_source and lp_source_clk are union members in i2c_master_bus_config_t,
+        // but LP_I2C_SCLK_DEFAULT is not a valid i2c_clock_source_t value, so
+        // i2c_new_master_bus returns ESP_ERR_NOT_SUPPORTED if we pass I2C_CLK_SRC_DEFAULT
+        // for an LP port.
+#if SOC_LP_I2C_SUPPORTED
+        if (dev->port == (i2c_port_t)LP_I2C_NUM_0)
+            bus_config.clk_source = LP_I2C_SCLK_DEFAULT;
+        else
+#endif
+            bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
 
         res = i2c_new_master_bus(&bus_config, &port_state->bus_handle);
         if (res == ESP_OK)
