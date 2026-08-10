@@ -346,6 +346,65 @@ esp_err_t i2c_dev_give_mutex(i2c_dev_t *dev)
     return ESP_OK;
 }
 
+esp_err_t i2c_dev_invalidate_handle(i2c_dev_t *dev)
+{
+    if (!dev)
+        return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGV(TAG, "[0x%02x at %d] Invalidating device handle for reconfiguration", dev->addr, dev->port);
+
+    // Check if port is valid and initialized
+    if (dev->port >= I2C_NUM_MAX)
+    {
+        ESP_LOGE(TAG, "[0x%02x at %d] Invalid port number", dev->addr, dev->port);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    i2c_port_state_t *port_state = &i2c_ports[dev->port];
+
+    // Check if port mutex exists
+    if (!port_state->lock)
+    {
+        ESP_LOGE(TAG, "[0x%02x at %d] Port not initialized - call i2cdev_init() first", dev->addr, dev->port);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Take port mutex for thread-safe handle removal
+    if (xSemaphoreTake(port_state->lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "[0x%02x at %d] Could not take port mutex for handle invalidation", dev->addr, dev->port);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t result = ESP_OK;
+
+    // Remove device handle if it exists
+    if (dev->dev_handle)
+    {
+        ESP_LOGV(TAG, "[0x%02x at %d] Removing device handle %p", dev->addr, dev->port, dev->dev_handle);
+
+        esp_err_t rm_res = i2c_master_bus_rm_device((i2c_master_dev_handle_t)dev->dev_handle);
+        if (rm_res != ESP_OK)
+        {
+            ESP_LOGW(TAG, "[0x%02x at %d] Failed to remove device handle: %s",
+                     dev->addr, dev->port, esp_err_to_name(rm_res));
+            result = rm_res;
+        }
+
+        // Always NULL the handle to force recreation on next operation
+        dev->dev_handle = NULL;
+        ESP_LOGV(TAG, "[0x%02x at %d] Device handle invalidated, will be recreated on next I2C operation",
+                 dev->addr, dev->port);
+    }
+    else
+    {
+        ESP_LOGV(TAG, "[0x%02x at %d] No device handle to invalidate", dev->addr, dev->port);
+    }
+
+    xSemaphoreGive(port_state->lock);
+    return result;
+}
+
 // i2c_setup_port: Initializes the I2C master bus for a given port if not already done.
 // It uses pin configurations from dev->cfg.sda_io_num and dev->cfg.scl_io_num.
 // The pins for a port are fixed after the first device initializes it.
@@ -580,13 +639,20 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
             .dev_addr_length = dev->addr_bit_len,
             .device_address = dev->addr,
             .scl_speed_hz = effective_dev_speed,
-            .flags.disable_ack_check = false,
+            .flags.disable_ack_check = dev->disable_ack_check,
         };
 
         res = i2c_master_bus_add_device(port_state->bus_handle, &dev_config, (i2c_master_dev_handle_t *)&dev->dev_handle);
         if (res == ESP_OK)
         {
             ESP_LOGI(TAG, "[0x%02x at %d] Device added successfully (Device Handle: %p, Speed: %" PRIu32 " Hz).", dev->addr, dev->port, dev->dev_handle, effective_dev_speed);
+
+            // Log if ACK checking is disabled (non-standard configuration)
+            if (dev->disable_ack_check)
+            {
+                ESP_LOGW(TAG, "[0x%02x at %d] WARNING: ACK checking DISABLED - communication errors won't be detected",
+                         dev->addr, dev->port);
+            }
 
             // Increment the port reference count for each device successfully added
             port_state->ref_count++;

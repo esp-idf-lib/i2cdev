@@ -143,6 +143,9 @@ typedef enum
  * │ - dev->cfg.sda_pullup_en - Enable internal SDA pullup                │
  * │ - dev->cfg.scl_pullup_en - Enable internal SCL pullup                │
  * │ - dev->timeout_ticks     - Legacy driver timeout (legacy only)       │
+ * │ - dev->disable_ack_check - Disable ACK checking (false=default)      │
+ * │   WARNING: Changing after first transaction requires handle          │
+ * │            invalidation via i2c_dev_invalidate_handle()              │
  * └──────────────────────────────────────────────────────────────────────┘
  *
  * ┌─── AUTO-POPULATED (library fills these) ─────────────────────────────┐
@@ -174,6 +177,11 @@ typedef struct
 
     // ═══ Legacy Driver Compatibility ═══
     uint32_t timeout_ticks; //!< Clock stretching timeout - Legacy driver only
+
+    // ═══ Device Behavior Configuration (OPTIONAL) ═══
+    bool disable_ack_check;  //!< Disable ACK checking (false=enabled [default], true=disabled)
+    //!< WARNING: PERMANENT after first I2C transaction unless handle invalidated
+    //!< Use i2c_dev_invalidate_handle() to force reconfiguration
 
     // ═══ User Configuration (REQUIRED) ═══
     // Configuration structure with i2c_config_t compatible field layout.
@@ -250,6 +258,31 @@ esp_err_t i2c_dev_take_mutex(i2c_dev_t *dev);
  * @return `ESP_OK` on success
  */
 esp_err_t i2c_dev_give_mutex(i2c_dev_t *dev);
+
+/**
+ * @brief Invalidate device handle to force recreation on next I2C operation
+ *
+ * Use this when you need to change device configuration (like disable_ack_check)
+ * after the device has already been used. The handle will be recreated with the
+ * new config on the next I2C transaction.
+ *
+ * This is needed because ESP-IDF caches device handles for performance, so just
+ * changing the config field won't do anything unless you invalidate the handle first.
+ *
+ * @note Thread-safe (uses port mutex), but don't call during active I2C operations
+ *
+ * Example (SCD4x wake-up that doesn't ACK):
+ *   dev->disable_ack_check = true;
+ *   i2c_dev_invalidate_handle(dev);
+ *   i2c_dev_write(...);  // No ACK required
+ *   dev->disable_ack_check = false;
+ *   i2c_dev_invalidate_handle(dev);
+ *
+ * @param dev Device descriptor
+ * @return ESP_OK on success, ESP_ERR_INVALID_ARG if dev is NULL,
+ *         ESP_ERR_TIMEOUT if mutex couldn't be acquired
+ */
+esp_err_t i2c_dev_invalidate_handle(i2c_dev_t *dev);
 
 /**
  * @brief Check the availability of a device on the I2C bus (New Driver) - legacy's i2c_dev_probe function equivalent.
