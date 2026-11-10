@@ -14,7 +14,6 @@ config I2CDEV_USE_LEGACY_DRIVER
 config I2CDEV_AUTO_ENABLE_PULLUPS
 	bool "Automatically enable internal I2C pullups when not configured"
 	default n
-	depends on !IDF_TARGET_ESP8266
 	help
 		When enabled, internal pullup resistors are automatically enabled
 		when both sda_pullup_en and scl_pullup_en are false (default state).
