@@ -264,6 +264,11 @@ esp_err_t i2cdev_done()
     return ESP_OK;
 }
 
+esp_err_t i2cdev_get_shared_handle(i2c_port_t port, void **bus_handle)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
 esp_err_t i2c_dev_create_mutex(i2c_dev_t *dev)
 {
 #if !CONFIG_I2CDEV_NOLOCK
