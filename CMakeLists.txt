@@ -5,9 +5,16 @@ eil_check_idf_has_esp_drivers()
 # List of common ESP-IDF components required by this component
 set(REQUIRED_COMPONENTS log freertos esp_idf_lib_helpers)
 
-# Add version-specific required componenets
+# Add version-specific required components.
+#
+# NOTE: "driver" must be listed unconditionally on ESP-IDF versions that also
+# provide the split esp_driver_* components. i2cdev_legacy.c includes
+# <driver/i2c.h> (provided by "driver") whenever CONFIG_I2CDEV_USE_LEGACY_DRIVER
+# is enabled. That Kconfig option is not yet visible during the first CMake
+# configure pass of a clean project, so deriving the requirement list from it
+# would leave the legacy build without the "driver" include path.
 if(EIL_IDF_HAS_ESP_DRIVERS)
-    list(APPEND REQUIRED_COMPONENTS esp_driver_gpio esp_driver_i2c)
+    list(APPEND REQUIRED_COMPONENTS driver esp_driver_gpio esp_driver_i2c)
 else()
     list(APPEND REQUIRED_COMPONENTS driver)
 endif()

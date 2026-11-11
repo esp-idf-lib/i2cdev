@@ -42,10 +42,12 @@ config I2CDEV_DEFAULT_SCL_PIN
 		Default SCL pin for I2C devices.
 
 config I2CDEV_MAX_DEVICES_PER_PORT
-	int "Maximum number of devices per I2C port"
+	int "Maximum number of devices per I2C port (legacy driver only)"
 	default 8
 	help
-		Maximum number of devices that can be registered on a single I2C port.
+		Maximum number of devices that can be tracked on a single I2C port.
+		Used by the legacy driver only: the new i2c_master based driver keeps a
+		dynamic list and accepts any number of devices per port.
 
 config I2CDEV_TIMEOUT
     int "I2C transaction timeout, milliseconds"
@@ -53,12 +55,19 @@ config I2CDEV_TIMEOUT
     range 10 5000
     
 config I2CDEV_NOLOCK
-	bool "Disable the use of mutexes"
+	bool "Disable per-device mutexes"
 	default n
 	help
-		Attention! After enabling this option, all I2C device
-		drivers will become non-thread safe. 
-		Use this option if you need to access your I2C devices
-		from interrupt handlers. 
+		Disables the per-device mutex (dev->mutex) and makes
+		i2c_dev_take_mutex()/i2c_dev_give_mutex(), as well as the
+		I2C_DEV_TAKE_MUTEX/I2C_DEV_GIVE_MUTEX macros, no-ops.
+
+		Bus-level management is not affected: the port mutex, device
+		handles and bus teardown in i2cdev_done() still run, so devices
+		are removed from the bus and the bus is released as usual.
+
+		Use this option only when all access to each device is already
+		serialized by the caller, or when devices must be accessed from
+		interrupt context where taking a mutex is not allowed.
 
 endmenu

@@ -38,6 +38,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "i2cdev";
@@ -52,18 +53,25 @@ static const char *TAG = "i2cdev";
 #define I2C_RETRY_BASE_DELAY_MS     20
 #define I2CDEV_MAX_STACK_ALLOC_SIZE 32 // Stack allocation threshold to avoid heap fragmentation for small buffers
 
+// Node of the per-port list of devices whose handle must be removed on cleanup.
+// The list has no fixed size: any number of devices can share a port.
+typedef struct i2c_dev_node
+{
+    struct i2c_dev_node *next;
+    i2c_dev_t *dev;
+} i2c_dev_node_t;
+
 typedef struct
 {
     SemaphoreHandle_t lock;             // Mutex for exclusive access to this port's state
     i2c_master_bus_handle_t bus_handle; // Handle to the initialized I2C master bus
     bool installed;                     // Flag indicating if the bus for this port has been installed
-    uint32_t ref_count;                 // Number of devices currently active on this bus port
     int sda_pin_current;                // Actual SDA pin the bus was initialized with
     int scl_pin_current;                // Actual SCL pin the bus was initialized with
+    i2c_dev_node_t *devices;            // Devices added to this bus, newest first
 } i2c_port_state_t;
 
 static i2c_port_state_t i2c_ports[I2C_NUM_MAX] = { 0 };
-static i2c_dev_t *active_devices[I2C_NUM_MAX][CONFIG_I2CDEV_MAX_DEVICES_PER_PORT] = { { NULL } };
 
 // Helper to register a device
 static esp_err_t register_device(i2c_dev_t *dev)
@@ -71,36 +79,64 @@ static esp_err_t register_device(i2c_dev_t *dev)
     if (!dev)
         return ESP_ERR_INVALID_ARG;
     int port = dev->port;
-    if (port >= I2C_NUM_MAX)
+    if (port < 0 || port >= I2C_NUM_MAX)
         return ESP_ERR_INVALID_ARG;
 
     // Note: Port mutex should be held by caller
-    for (int i = 0; i < CONFIG_I2CDEV_MAX_DEVICES_PER_PORT; i++)
+    i2c_dev_node_t *node = calloc(1, sizeof(i2c_dev_node_t));
+    if (!node)
     {
-        if (active_devices[port][i] == NULL)
-        {
-            active_devices[port][i] = dev;
-            ESP_LOGV(TAG, "[0x%02x at %d] Registered device in slot %d", dev->addr, port, i);
-            return ESP_OK;
-        }
+        ESP_LOGE(TAG, "[0x%02x at %d] Could not allocate device tracking node", dev->addr, port);
+        return ESP_ERR_NO_MEM;
     }
-    ESP_LOGE(TAG, "[0x%02x at %d] No free slots to register device - limit reached", dev->addr, port);
-    return ESP_ERR_NO_MEM;
+
+    node->dev = dev;
+    node->next = i2c_ports[port].devices;
+    i2c_ports[port].devices = node;
+    ESP_LOGV(TAG, "[0x%02x at %d] Registered device for cleanup", dev->addr, port);
+    return ESP_OK;
+}
+
+// Helper to drop a device from the per-port list. The node is allocated by
+// register_device(), so it must be freed here.
+static void deregister_device(i2c_dev_t *dev)
+{
+    i2c_dev_node_t **link = &i2c_ports[dev->port].devices;
+    while (*link)
+    {
+        if ((*link)->dev == dev)
+        {
+            i2c_dev_node_t *node = *link;
+            *link = node->next;
+            free(node);
+            ESP_LOGV(TAG, "[0x%02x at %d] Deregistered device", dev->addr, dev->port);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+// Helper to release the whole per-port device list
+static void free_device_list(i2c_port_state_t *port_state)
+{
+    i2c_dev_node_t *node = port_state->devices;
+    while (node)
+    {
+        i2c_dev_node_t *next = node->next;
+        free(node);
+        node = next;
+    }
+    port_state->devices = NULL;
 }
 
 esp_err_t i2cdev_init(void)
 {
     ESP_LOGV(TAG, "Initializing I2C subsystem...");
 
-    // Guard against re-initialization to prevent resource leaks
-    static bool initialized = false;
-    if (initialized)
-    {
-        ESP_LOGW(TAG, "I2C subsystem already initialized, skipping re-initialization");
-        return ESP_OK;
-    }
-
-    memset(active_devices, 0, sizeof(active_devices));
+    // There is no separate "initialized" flag: the state of the subsystem is
+    // derived from i2c_ports[]. A port that owns a mutex is usable, so calling
+    // i2cdev_init() again only creates the missing mutexes. This makes
+    // init -> done -> init work, and a partially failed init can be retried.
     for (int i = 0; i < I2C_NUM_MAX; i++)
     {
         if (!i2c_ports[i].lock)
@@ -113,24 +149,30 @@ esp_err_t i2cdev_init(void)
             }
             ESP_LOGV(TAG, "Created port mutex %d", i);
         }
-        i2c_ports[i].installed = false;
-        i2c_ports[i].ref_count = 0;
-        i2c_ports[i].bus_handle = NULL;
-        i2c_ports[i].sda_pin_current = -1;
-        i2c_ports[i].scl_pin_current = -1;
+
+        // Reset a port only while no bus is installed. A bus handle that is
+        // still alive (i2cdev_done() failed to delete it) must be kept,
+        // otherwise the platform I2C port stays occupied while i2cdev loses
+        // its only reference to it.
+        if (!i2c_ports[i].installed)
+        {
+            i2c_ports[i].bus_handle = NULL;
+            i2c_ports[i].sda_pin_current = -1;
+            i2c_ports[i].scl_pin_current = -1;
+            free_device_list(&i2c_ports[i]);
+        }
     }
 
-    initialized = true;  // Mark as initialized
     ESP_LOGV(TAG, "I2C subsystem initialized.");
     return ESP_OK;
 }
 
 esp_err_t i2c_dev_create_mutex(i2c_dev_t *dev)
 {
-#if !CONFIG_I2CDEV_NOLOCK
     if (!dev)
         return ESP_ERR_INVALID_ARG;
 
+#if !CONFIG_I2CDEV_NOLOCK
     ESP_LOGV(TAG, "[0x%02x at %d] Creating device mutex...", dev->addr, dev->port);
     if (dev->mutex)
     {
@@ -146,57 +188,56 @@ esp_err_t i2c_dev_create_mutex(i2c_dev_t *dev)
     }
 
     ESP_LOGV(TAG, "[0x%02x at %d] Device mutex created (Handle: %p)", dev->addr, dev->port, dev->mutex);
+#else
+    ESP_LOGV(TAG, "[0x%02x at %d] Mutex creation skipped (CONFIG_I2CDEV_NOLOCK=1)", dev->addr, dev->port);
+#endif
 
-    // Register the device for cleanup tracking (under port mutex for consistency)
-    if (dev->port < I2C_NUM_MAX && i2c_ports[dev->port].lock)
-    {
-        if (xSemaphoreTake(i2c_ports[dev->port].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) == pdTRUE)
-        {
-            esp_err_t reg_res = register_device(dev);
-            if (reg_res != ESP_OK)
-            {
-                ESP_LOGW(TAG, "[0x%02x at %d] Failed to register device: %s - device will work but cleanup tracking disabled", dev->addr, dev->port, esp_err_to_name(reg_res));
-                // Continue - device can still function without registration tracking
-            }
-            else
-            {
-                ESP_LOGV(TAG, "[0x%02x at %d] Device registered successfully for cleanup tracking", dev->addr, dev->port);
-            }
-            xSemaphoreGive(i2c_ports[dev->port].lock);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "[0x%02x at %d] Could not take port mutex for device registration", dev->addr, dev->port);
-            // Continue - device can still function without registration tracking
-        }
-    }
-
-    // Set default address bit length if not explicitly set
-    if (dev->addr_bit_len != I2C_ADDR_BIT_LEN_7 && dev->addr_bit_len != I2C_ADDR_BIT_LEN_10)
+    // Address bit length is not a locking concern: normalise it in both modes.
+    // The device itself is registered on the bus (and therefore tracked for
+    // cleanup) in i2c_setup_device(), where the handle is actually created.
+    if (dev->addr_bit_len != I2C_ADDR_BIT_LEN_7
+#if SOC_I2C_SUPPORT_10BIT_ADDR
+            && dev->addr_bit_len != I2C_ADDR_BIT_LEN_10
+#endif
+       )
     {
         ESP_LOGV(TAG, "[0x%02x at %d] Setting default 7-bit address format", dev->addr, dev->port);
         dev->addr_bit_len = I2C_ADDR_BIT_LEN_7;
     }
-#else
-    ESP_LOGV(TAG, "[0x%02x at %d] Mutex creation skipped (CONFIG_I2CDEV_NOLOCK=1)", dev->addr, dev->port);
-#endif
+
     return ESP_OK;
+}
+
+// Drops the per-device mutex. Bus-level cleanup does not depend on it, and
+// with CONFIG_I2CDEV_NOLOCK=1 no per-device mutex is ever created.
+static void delete_device_mutex(i2c_dev_t *dev)
+{
+#if !CONFIG_I2CDEV_NOLOCK
+    if (dev->mutex)
+    {
+        vSemaphoreDelete(dev->mutex);
+        dev->mutex = NULL;
+    }
+#else
+    (void)dev;
+#endif
 }
 
 esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
 {
-#if !CONFIG_I2CDEV_NOLOCK
+    esp_err_t result = ESP_OK;
+
     if (!dev)
         return ESP_ERR_INVALID_ARG;
 
     ESP_LOGV(TAG, "[0x%02x at %d] Deleting device mutex and cleaning up resources", dev->addr, dev->port);
 
-    // If we cannot safely touch the port state (bad port index, or the
-    // subsystem was never initialized), there is no bus handle to release
-    // and no ref_count to decrement. Just drop the device mutex.
-    if (dev->port >= I2C_NUM_MAX || !i2c_ports[dev->port].lock)
+    // The bus lifecycle (device handle, the per-port device list and the port's
+    // master bus) is handled in both locking modes: disabling device mutexes
+    // must not disable cleanup.
+    if (dev->port < 0 || dev->port >= I2C_NUM_MAX || !i2c_ports[dev->port].lock)
     {
-        if (dev->port >= I2C_NUM_MAX)
+        if (dev->port < 0 || dev->port >= I2C_NUM_MAX)
         {
             ESP_LOGE(TAG, "[0x%02x at %d] Invalid port %d, skipping port-scoped cleanup", dev->addr, dev->port, dev->port);
         }
@@ -204,11 +245,7 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
         {
             ESP_LOGW(TAG, "[0x%02x at %d] I2C subsystem not initialized, skipping port-scoped cleanup", dev->addr, dev->port);
         }
-        if (dev->mutex)
-        {
-            vSemaphoreDelete(dev->mutex);
-            dev->mutex = NULL;
-        }
+        delete_device_mutex(dev);
         return ESP_OK;
     }
 
@@ -223,9 +260,12 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
 
     // Capture whether this device was actually added to the bus before
     // we clear the field.
-    bool was_on_bus = (dev->dev_handle != NULL);
+    bool was_on_bus = dev->dev_handle;
 
-    // 1) Remove the device from the bus, if it was added
+    // 1) Remove the device from the bus, if it was added.
+    // The handle is released only when the driver reports success: on failure
+    // the device stays attached to the bus, and keeping the pointer allows a
+    // repeated call to retry the removal instead of silently losing the handle.
     if (was_on_bus)
     {
         ESP_LOGV(TAG, "[0x%02x at %d] Removing device handle %p from bus", dev->addr, dev->port, dev->dev_handle);
@@ -233,72 +273,37 @@ esp_err_t i2c_dev_delete_mutex(i2c_dev_t *dev)
         if (rm_res != ESP_OK)
         {
             ESP_LOGW(TAG, "[0x%02x at %d] Failed to remove device handle: %s", dev->addr, dev->port, esp_err_to_name(rm_res));
+            result = rm_res;
         }
-        dev->dev_handle = NULL;
-    }
-
-    // 2) Deregister from active_devices[] under the same port mutex
-    for (int i = 0; i < CONFIG_I2CDEV_MAX_DEVICES_PER_PORT; i++)
-    {
-        if (active_devices[dev->port][i] == dev)
+        else
         {
-            active_devices[dev->port][i] = NULL;
-            ESP_LOGV(TAG, "[0x%02x at %d] Deregistered device from slot %d", dev->addr, dev->port, i);
-            break;
+            dev->dev_handle = NULL;
         }
     }
 
-    // 3) Decrement ref_count; delete the bus if this was the last device
-    if (was_on_bus && port_state->installed && port_state->ref_count > 0)
-    {
-        port_state->ref_count--;
-        ESP_LOGV(TAG, "[Port %d] Decremented ref_count to %" PRIu32, dev->port, port_state->ref_count);
+    // 2) Deregister the device from the per-port list under the same port mutex
+    deregister_device(dev);
 
-        if (port_state->ref_count == 0)
-        {
-            ESP_LOGI(TAG, "[Port %d] Last device removed, cleaning up port's bus", dev->port);
-            if (port_state->bus_handle)
-            {
-                ESP_LOGI(TAG, "[Port %d] Deleting bus handle %p", dev->port, port_state->bus_handle);
-                esp_err_t del_bus_res = i2c_del_master_bus(port_state->bus_handle);
-                if (del_bus_res != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "[Port %d] Failed to delete master bus: %s", dev->port, esp_err_to_name(del_bus_res));
-                }
-                port_state->bus_handle = NULL;
-            }
-            port_state->installed = false;
-            port_state->sda_pin_current = -1;
-            port_state->scl_pin_current = -1;
-        }
-    }
-    else if (!was_on_bus)
-    {
-        ESP_LOGV(TAG, "[0x%02x at %d] Device was never added to bus, skipping ref_count decrement", dev->addr, dev->port);
-    }
+    // The bus itself is not deleted here: it lives from i2cdev_init() (first
+    // operation) until i2cdev_done(). Removing the last known device must not
+    // tear the bus down, because other consumers may hold the shared bus
+    // handle (i2cdev_get_shared_handle()) or keep devices that this library
+    // does not track.
 
     xSemaphoreGive(port_state->lock);
 
     // 4) Finally, drop the per-device mutex
-    if (dev->mutex)
-    {
-        vSemaphoreDelete(dev->mutex);
-        dev->mutex = NULL;
-    }
-    else
-    {
-        ESP_LOGV(TAG, "[0x%02x at %d] Device mutex was NULL, nothing to delete", dev->addr, dev->port);
-    }
-#endif
-    return ESP_OK;
+    delete_device_mutex(dev);
+
+    return result;
 }
 
 esp_err_t i2c_dev_take_mutex(i2c_dev_t *dev)
 {
-#if !CONFIG_I2CDEV_NOLOCK
     if (!dev)
         return ESP_ERR_INVALID_ARG;
 
+#if !CONFIG_I2CDEV_NOLOCK
     ESP_LOGV(TAG, "[0x%02x at %d] Attempting to take device mutex (Handle: %p)...", dev->addr, dev->port, dev->mutex);
     if (!dev->mutex)
     {
@@ -322,10 +327,10 @@ esp_err_t i2c_dev_take_mutex(i2c_dev_t *dev)
 
 esp_err_t i2c_dev_give_mutex(i2c_dev_t *dev)
 {
-#if !CONFIG_I2CDEV_NOLOCK
     if (!dev)
         return ESP_ERR_INVALID_ARG;
 
+#if !CONFIG_I2CDEV_NOLOCK
     ESP_LOGV(TAG, "[0x%02x at %d] Giving device mutex (Handle: %p)...", dev->addr, dev->port, dev->mutex);
     if (!dev->mutex)
     {
@@ -353,7 +358,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
 {
     if (!dev)
         return ESP_ERR_INVALID_ARG;
-    if (dev->port >= I2C_NUM_MAX)
+    if (dev->port < 0 || dev->port >= I2C_NUM_MAX)
     {
         ESP_LOGE(TAG, "Invalid I2C port number: %d", dev->port);
         return ESP_ERR_INVALID_ARG;
@@ -390,6 +395,15 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
             return ESP_ERR_INVALID_ARG;
         }
 
+        // SDA and SCL must be different pins. Zero-initialized i2c_dev_t leaves
+        // both at GPIO0, which would configure one pin as SDA and SCL at once.
+        if (sda_pin == scl_pin)
+        {
+            ESP_LOGE(TAG, "[Port %d] SDA and SCL are the same pin (GPIO%d). Set dev->cfg.sda_io_num/dev->cfg.scl_io_num or Kconfig defaults.", dev->port, (int)sda_pin);
+            xSemaphoreGive(port_state->lock);
+            return ESP_ERR_INVALID_ARG;
+        }
+
         /*
          * OPTIONAL I2C PULLUP AUTO-CONFIGURATION
          *
@@ -401,6 +415,10 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
          * Manual pullup configuration:
          * - Set sda_pullup_en=true, scl_pullup_en=true for internal pullups
          * - Set sda_pullup_en=false, scl_pullup_en=false for external pullups
+         *
+         * The IDF bus config has a single `enable_internal_pullup` flag for both
+         * lines, so a mixed request (only SDA or only SCL) is applied per line with
+         * gpio_set_pull_mode() right after the bus is created.
          */
 
         // Read user's pullup configuration (default false if not set)
@@ -428,7 +446,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
             .sda_io_num = sda_pin,
             .scl_io_num = scl_pin,
             .glitch_ignore_cnt = 7,
-            .flags.enable_internal_pullup = (sda_pullup || scl_pullup),
+            .flags.enable_internal_pullup = (sda_pullup && scl_pullup),
             // Bus speed is not set here. It's per-device or a global target for the bus can be set
             // if desired, but i2c_master supports per-device speeds.
         };
@@ -447,8 +465,19 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
         res = i2c_new_master_bus(&bus_config, &port_state->bus_handle);
         if (res == ESP_OK)
         {
+            // The IDF bus config enables internal pullups on both lines at once,
+            // so a mixed request (only SDA or only SCL) is applied per line here.
+            if (sda_pullup != scl_pullup)
+            {
+                gpio_num_t pullup_pin = sda_pullup ? sda_pin : scl_pin;
+                esp_err_t pull_res = gpio_set_pull_mode(pullup_pin, GPIO_PULLUP_ONLY);
+                if (pull_res == ESP_OK)
+                    ESP_LOGI(TAG, "[Port %d] Internal pullup enabled on GPIO%d only (SDA:%d, SCL:%d)", dev->port, (int)pullup_pin, sda_pullup, scl_pullup);
+                else
+                    ESP_LOGW(TAG, "[Port %d] Could not enable internal pullup on GPIO%d: %s", dev->port, (int)pullup_pin, esp_err_to_name(pull_res));
+            }
+
             port_state->installed = true;
-            port_state->ref_count = 0; // Will be incremented when a device is successfully added
             port_state->sda_pin_current = sda_pin;
             port_state->scl_pin_current = scl_pin;
             dev->sda_pin = sda_pin; // Update dev struct with actual pins used
@@ -484,7 +513,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
             dev->sda_pin = port_state->sda_pin_current; // Update dev struct with actual pins used
             dev->scl_pin = port_state->scl_pin_current;
         }
-        // ref_count is managed by i2c_setup_device when adding/removing device handles
+        // The bus outlives individual devices: it is deleted in i2cdev_done()
     }
 
     xSemaphoreGive(port_state->lock);
@@ -493,7 +522,7 @@ static esp_err_t i2c_setup_port(i2c_dev_t *dev) // dev is non-const to update de
 }
 
 // i2c_setup_device: Ensures port is set up and adds the device to the bus if not already added.
-// It also registers the device in active_devices for cleanup purposes.
+// It also registers the device in the port's device list for cleanup purposes.
 static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies dev->dev_handle, dev->addr_bit_len
 {
     if (!dev)
@@ -538,23 +567,27 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
     }
 #endif
 
-    if (dev->dev_handle == NULL)
+    i2c_port_state_t *port_state = &i2c_ports[dev->port];
+
+    // Check if i2cdev subsystem is initialized
+    if (!port_state->lock)
     {
-        i2c_port_state_t *port_state = &i2c_ports[dev->port];
+        ESP_LOGE(TAG, "[0x%02x at %d] I2C subsystem not initialized - call i2cdev_init() first", dev->addr, dev->port);
+        return ESP_ERR_INVALID_STATE;
+    }
 
-        // Check if i2cdev subsystem is initialized
-        if (!port_state->lock)
-        {
-            ESP_LOGE(TAG, "[0x%02x at %d] I2C subsystem not initialized - call i2cdev_init() first", dev->addr, dev->port);
-            return ESP_ERR_INVALID_STATE;
-        }
+    if (xSemaphoreTake(port_state->lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "[0x%02x at %d] Could not take port mutex for device add", dev->addr, dev->port);
+        return ESP_ERR_TIMEOUT;
+    }
 
-        if (xSemaphoreTake(port_state->lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
-        {
-            ESP_LOGE(TAG, "[0x%02x at %d] Could not take port mutex for device add", dev->addr, dev->port);
-            return ESP_ERR_TIMEOUT;
-        }
-
+    // Decide under the port mutex whether the device still has to be added:
+    // i2c_master_bus_add_device() does not detect duplicates, so checking the
+    // handle before taking the mutex would let two tasks add the same device
+    // twice and leaking the first handle.
+    if (!dev->dev_handle)
+    {
         if (!port_state->installed || !port_state->bus_handle)
         {
             ESP_LOGE(TAG, "[0x%02x at %d] Cannot add device, bus for port %d not ready!", dev->addr, dev->port, dev->port);
@@ -586,24 +619,39 @@ static esp_err_t i2c_setup_device(i2c_dev_t *dev) // dev is non-const - modifies
         res = i2c_master_bus_add_device(port_state->bus_handle, &dev_config, (i2c_master_dev_handle_t *)&dev->dev_handle);
         if (res == ESP_OK)
         {
-            ESP_LOGI(TAG, "[0x%02x at %d] Device added successfully (Device Handle: %p, Speed: %" PRIu32 " Hz).", dev->addr, dev->port, dev->dev_handle, effective_dev_speed);
-
-            // Increment the port reference count for each device successfully added
-            port_state->ref_count++;
-            ESP_LOGV(TAG, "[Port %d] Incremented ref_count to %" PRIu32, dev->port, port_state->ref_count);
+            // Track the device for cleanup while the port mutex is held: the
+            // registration must cover exactly the devices that have a handle.
+            // A device that cannot be tracked would survive i2cdev_done() and
+            // block bus deletion forever, so this failure is fatal.
+            res = register_device(dev);
+            if (res != ESP_OK)
+            {
+                ESP_LOGE(TAG, "[0x%02x at %d] Failed to register device: %s - removing it from the bus", dev->addr, dev->port, esp_err_to_name(res));
+                esp_err_t rm_res = i2c_master_bus_rm_device((i2c_master_dev_handle_t)dev->dev_handle);
+                if (rm_res != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "[0x%02x at %d] Failed to remove untracked device handle: %s", dev->addr, dev->port, esp_err_to_name(rm_res));
+                }
+                dev->dev_handle = NULL;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "[0x%02x at %d] Device added successfully (Device Handle: %p, Speed: %" PRIu32 " Hz).", dev->addr, dev->port, dev->dev_handle, effective_dev_speed);
+            }
         }
         else
         {
             ESP_LOGE(TAG, "[0x%02x at %d] Failed to add device to bus: %d (%s)", dev->addr, dev->port, res, esp_err_to_name(res));
             dev->dev_handle = NULL;
         }
-        xSemaphoreGive(port_state->lock);
     }
     else
     {
         ESP_LOGV(TAG, "[0x%02x at %d] Device handle %p already exists. Skipping add.", dev->addr, dev->port, dev->dev_handle);
         res = ESP_OK;
     }
+
+    xSemaphoreGive(port_state->lock);
 
     ESP_LOGV(TAG, "[0x%02x at %d] Device context setup finished with res %d.", dev->addr, dev->port, res);
     return res;
@@ -623,8 +671,9 @@ static esp_err_t i2c_do_operation_with_retry(i2c_dev_t *dev, esp_err_t (*i2c_fun
 
     while (retry <= I2C_MAX_RETRIES)
     {
-        // Ensure device is set up before each attempt, in case handle became stale or bus was reset
-        // This is more robust if issues like bus errors or device resets occur.
+        // Ensure the device is set up before each attempt: the bus may have
+        // been installed after a previous failure, or the port may have been
+        // reconfigured. An existing handle is reused as is.
         res = i2c_setup_device(dev);
         if (res != ESP_OK)
         {
@@ -659,41 +708,12 @@ static esp_err_t i2c_do_operation_with_retry(i2c_dev_t *dev, esp_err_t (*i2c_fun
 
         ESP_LOGW(TAG, "[0x%02x at %d] I2C op failed (Try %d, Handle %p): %d (%s).", dev->addr, dev->port, retry, dev->dev_handle, res, esp_err_to_name(res));
 
-        // Only remove handle on errors that indicate handle corruption or permanent invalidity
-        // Don't remove on temporary errors like ESP_ERR_TIMEOUT, ESP_FAIL (NACK), etc.
-        bool should_remove_handle = false;
-        switch (res)
-        {
-            case ESP_ERR_INVALID_ARG:
-                // Handle was likely removed by another task or is corrupted
-                should_remove_handle = true;
-                ESP_LOGW(TAG, "[0x%02x at %d] Invalid argument error - handle may be corrupted", dev->addr, dev->port);
-                break;
-            case ESP_ERR_INVALID_STATE:
-                // I2C driver is in invalid state, handle likely needs recreation
-                should_remove_handle = true;
-                ESP_LOGW(TAG, "[0x%02x at %d] Invalid state error - handle may need recreation", dev->addr, dev->port);
-                break;
-            default:
-                // For other errors (timeout, NACK, bus busy, etc.), keep the handle
-                // These are usually temporary and don't require handle recreation
-                should_remove_handle = false;
-                ESP_LOGV(TAG, "[0x%02x at %d] Temporary error - keeping handle for retry", dev->addr, dev->port);
-                break;
-        }
-
-        if (should_remove_handle && dev->dev_handle)
-        {
-            ESP_LOGW(TAG, "[0x%02x at %d] Removing potentially corrupted device handle %p after permanent error", dev->addr, dev->port, dev->dev_handle);
-            // Try to remove the handle from the bus before nullifying
-            esp_err_t rm_res = i2c_master_bus_rm_device(dev->dev_handle);
-            if (rm_res != ESP_OK)
-            {
-                ESP_LOGW(TAG, "[0x%02x at %d] Failed to remove corrupted handle (expected): %s", dev->addr, dev->port, esp_err_to_name(rm_res));
-                // This is expected if the handle was already invalid - continue cleanup
-            }
-            dev->dev_handle = NULL;
-        }
+        // The device handle is deliberately left untouched here. It is created
+        // in i2c_setup_device() and destroyed in i2c_dev_delete_mutex(), both
+        // of which run under the port mutex and keep the per-port device list
+        // consistent. Releasing it from a transfer error path would (a) race
+        // with tasks still using the handle and (b) leave a stale entry in the
+        // per-port device list. Errors are reported to the caller instead.
 
         retry++;
         if (retry <= I2C_MAX_RETRIES)
@@ -742,7 +762,7 @@ esp_err_t i2c_dev_write(const i2c_dev_t *dev, const void *out_reg, size_t out_re
 {
     if (!dev)
         return ESP_ERR_INVALID_ARG;
-    if ((!out_reg || !out_reg_size) && (!out_data || !out_size))
+    if (!(out_reg && out_reg_size) && !(out_data && out_size))
         return ESP_ERR_INVALID_ARG;
 
     ESP_LOGV(TAG, "[0x%02x at %d] i2c_dev_write called (reg_size: %u, data_size: %u)", dev->addr, dev->port, out_reg_size, out_size);
@@ -801,7 +821,9 @@ esp_err_t i2c_dev_write(const i2c_dev_t *dev, const void *out_reg, size_t out_re
 
 esp_err_t i2c_dev_read_reg(const i2c_dev_t *dev, uint8_t reg, void *data, size_t size)
 {
-    if (!dev)
+    // Same contract as the legacy driver: a read without a destination buffer
+    // or without a size is a caller error, not a silent no-op.
+    if (!dev || !data || !size)
         return ESP_ERR_INVALID_ARG;
 
     ESP_LOGV(TAG, "[0x%02x at %d] i2c_dev_read_reg called (reg: 0x%02x, size: %u)", dev->addr, dev->port, reg, size);
@@ -810,7 +832,10 @@ esp_err_t i2c_dev_read_reg(const i2c_dev_t *dev, uint8_t reg, void *data, size_t
 
 esp_err_t i2c_dev_write_reg(const i2c_dev_t *dev, uint8_t reg, const void *data, size_t size)
 {
-    if (!dev)
+    // Same contract as the legacy driver: writing a register without data is a
+    // caller error. Use i2c_dev_write(dev, &reg, 1, NULL, 0) to write a bare
+    // register byte.
+    if (!dev || !data || !size)
         return ESP_ERR_INVALID_ARG;
 
     ESP_LOGV(TAG, "[0x%02x at %d] i2c_dev_write_reg called (reg: 0x%02x, size: %u)", dev->addr, dev->port, reg, size);
@@ -836,7 +861,7 @@ esp_err_t i2c_dev_check_present(const i2c_dev_t *dev_const)
     }
 
     // Now probe using the initialized bus
-    if (dev_const->port < I2C_NUM_MAX && i2c_ports[dev_const->port].lock)
+    if (dev_const->port >= 0 && dev_const->port < I2C_NUM_MAX && i2c_ports[dev_const->port].lock)
     {
         if (xSemaphoreTake(i2c_ports[dev_const->port].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) == pdTRUE)
         {
@@ -872,8 +897,10 @@ esp_err_t i2c_dev_check_present(const i2c_dev_t *dev_const)
     }
     else
     {
-        ESP_LOGE(TAG, "[0x%02x at %d] Invalid port or port not initialized", dev_const->addr, dev_const->port);
-        return ESP_ERR_INVALID_ARG;
+        // The port range is already validated in i2c_setup_port(), so the only
+        // way here is a port that was never initialized by i2cdev_init().
+        ESP_LOGE(TAG, "[0x%02x at %d] Port is not initialized, call i2cdev_init() first", dev_const->addr, dev_const->port);
+        return ESP_ERR_INVALID_STATE;
     }
 }
 
@@ -896,61 +923,86 @@ esp_err_t i2cdev_done(void)
     ESP_LOGV(TAG, "Cleaning up I2C subsystem (i2c_master)...");
     for (int i = 0; i < I2C_NUM_MAX; i++)
     {
-        if (i2c_ports[i].lock)
-        {
-            ESP_LOGV(TAG, "[Port %d] Cleaning up port...", i);
-            if (xSemaphoreTake(i2c_ports[i].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
-            {
-                ESP_LOGE(TAG, "[Port %d] Could not take port mutex for cleanup", i);
-                result = ESP_FAIL;
-            }
-            else
-            {
-                if (i2c_ports[i].installed)
-                {
-                    ESP_LOGV(TAG, "[Port %d] Removing active devices before deleting bus...", i);
-                    // Remove all registered devices for this port from the bus
-                    for (int j = 0; j < CONFIG_I2CDEV_MAX_DEVICES_PER_PORT; j++)
-                    {
-                        i2c_dev_t *dev_ptr = active_devices[i][j];
-                        if (dev_ptr != NULL && dev_ptr->dev_handle != NULL)
-                        {
-                            ESP_LOGV(TAG, "[Port %d] Removing device 0x%02x (Handle %p)", i, dev_ptr->addr, dev_ptr->dev_handle);
-                            esp_err_t rm_res = i2c_master_bus_rm_device(dev_ptr->dev_handle);
-                            if (rm_res != ESP_OK)
-                            {
-                                ESP_LOGE(TAG, "[Port %d] Failed to remove device 0x%02x handle: %d", i, dev_ptr->addr, rm_res);
-                                // Continue cleanup despite error
-                                if (result == ESP_OK)
-                                    result = rm_res; // Report first error
-                            }
-                            dev_ptr->dev_handle = NULL;
-                        }
-                    }
+        if (!i2c_ports[i].lock)
+            continue;
 
-                    ESP_LOGV(TAG, "[Port %d] Deleting master bus handle %p...", i, i2c_ports[i].bus_handle);
-                    esp_err_t del_res = i2c_del_master_bus(i2c_ports[i].bus_handle);
-                    if (del_res != ESP_OK)
+        ESP_LOGV(TAG, "[Port %d] Cleaning up port...", i);
+        if (xSemaphoreTake(i2c_ports[i].lock, pdMS_TO_TICKS(CONFIG_I2CDEV_TIMEOUT)) != pdTRUE)
+        {
+            // Another task owns the port. Neither its bus nor its mutex can be
+            // touched safely; leave the port intact so that a later call can
+            // finish the cleanup.
+            ESP_LOGE(TAG, "[Port %d] Could not take port mutex for cleanup", i);
+            if (result == ESP_OK)
+                result = ESP_ERR_TIMEOUT;
+            continue;
+        }
+
+        bool released = true;
+        if (i2c_ports[i].installed)
+        {
+            ESP_LOGV(TAG, "[Port %d] Removing active devices before deleting bus...", i);
+            // Remove all registered devices for this port from the bus. A
+            // handle is dropped only after a successful removal: on failure
+            // the device is still attached, and keeping the pointer allows a
+            // retry instead of blocking bus deletion forever.
+            for (i2c_dev_node_t *node = i2c_ports[i].devices; node; node = node->next)
+            {
+                i2c_dev_t *dev_ptr = node->dev;
+                if (dev_ptr && dev_ptr->dev_handle)
+                {
+                    ESP_LOGV(TAG, "[Port %d] Removing device 0x%02x (Handle %p)", i, dev_ptr->addr, dev_ptr->dev_handle);
+                    esp_err_t rm_res = i2c_master_bus_rm_device(dev_ptr->dev_handle);
+                    if (rm_res != ESP_OK)
                     {
-                        ESP_LOGE(TAG, "[Port %d] Failed to delete I2C bus during cleanup: %d", i, del_res);
+                        ESP_LOGE(TAG, "[Port %d] Failed to remove device 0x%02x handle: %d", i, dev_ptr->addr, rm_res);
                         if (result == ESP_OK)
-                            result = del_res;
+                            result = rm_res; // Report first error
+                        released = false;
                     }
+                    else
+                    {
+                        dev_ptr->dev_handle = NULL;
+                    }
+                }
+            }
+
+            if (released)
+            {
+                ESP_LOGV(TAG, "[Port %d] Deleting master bus handle %p...", i, i2c_ports[i].bus_handle);
+                esp_err_t del_res = i2c_del_master_bus(i2c_ports[i].bus_handle);
+                if (del_res != ESP_OK)
+                {
+                    // The bus is still installed in the driver. Keep the
+                    // handle: dropping it here would leak the port until
+                    // reboot, because i2cdev would no longer know about it.
+                    ESP_LOGE(TAG, "[Port %d] Failed to delete I2C bus during cleanup: %d", i, del_res);
+                    if (result == ESP_OK)
+                        result = del_res;
+                    released = false;
+                }
+                else
+                {
                     i2c_ports[i].installed = false;
                     i2c_ports[i].bus_handle = NULL;
-                    i2c_ports[i].ref_count = 0;
                 }
-                xSemaphoreGive(i2c_ports[i].lock);
-            } // End else (mutex taken)
+            }
+        }
 
-            ESP_LOGV(TAG, "[Port %d] Deleting port mutex...", i);
-            vSemaphoreDelete(i2c_ports[i].lock);
-            i2c_ports[i].lock = NULL;
-            // Clear the active device list for this port
-            memset(active_devices[i], 0, sizeof(active_devices[i]));
-            ESP_LOGV(TAG, "[Port %d] Cleanup complete.", i);
+        xSemaphoreGive(i2c_ports[i].lock);
 
-        } // end if lock exists
+        if (!released)
+        {
+            ESP_LOGW(TAG, "[Port %d] Port was not fully released, keeping it for a later cleanup attempt", i);
+            continue;
+        }
+
+        ESP_LOGV(TAG, "[Port %d] Deleting port mutex...", i);
+        vSemaphoreDelete(i2c_ports[i].lock);
+        i2c_ports[i].lock = NULL;
+        // Clear the device list for this port
+        free_device_list(&i2c_ports[i]);
+        ESP_LOGV(TAG, "[Port %d] Cleanup complete.", i);
     } // end for loop
     ESP_LOGV(TAG, "I2C subsystem cleanup finished with result: %d", result);
     return result;
@@ -958,7 +1010,7 @@ esp_err_t i2cdev_done(void)
 
 esp_err_t i2cdev_get_shared_handle(i2c_port_t port, void **bus_handle)
 {
-    if (port >= I2C_NUM_MAX || bus_handle == NULL)
+    if (port < 0 || port >= I2C_NUM_MAX || !bus_handle)
     {
         ESP_LOGE(TAG, "Invalid arguments: port=%d, bus_handle=%p", port, bus_handle);
         return ESP_ERR_INVALID_ARG;
@@ -967,7 +1019,7 @@ esp_err_t i2cdev_get_shared_handle(i2c_port_t port, void **bus_handle)
     i2c_port_state_t *port_state = &i2c_ports[port];
 
     // Check if i2cdev subsystem is initialized
-    if (port_state->lock == NULL)
+    if (!port_state->lock)
     {
         ESP_LOGE(TAG, "[Port %d] I2C subsystem not initialized - call i2cdev_init() first", port);
         return ESP_ERR_INVALID_STATE;
@@ -981,7 +1033,7 @@ esp_err_t i2cdev_get_shared_handle(i2c_port_t port, void **bus_handle)
     }
 
     // Check if bus is initialized
-    if (!port_state->installed || port_state->bus_handle == NULL)
+    if (!port_state->installed || !port_state->bus_handle)
     {
         xSemaphoreGive(port_state->lock);
         ESP_LOGE(TAG, "[Port %d] Bus not initialized - create an i2c_dev_t device first to initialize the bus", port);
@@ -991,9 +1043,9 @@ esp_err_t i2cdev_get_shared_handle(i2c_port_t port, void **bus_handle)
     // Return the bus handle
     *bus_handle = (void *)port_state->bus_handle;
 
-    ESP_LOGI(TAG, "[Port %d] Shared bus handle retrieved: %p (SDA=%d, SCL=%d, ref_count=%" PRIu32 ")",
+    ESP_LOGI(TAG, "[Port %d] Shared bus handle retrieved: %p (SDA=%d, SCL=%d)",
              port, port_state->bus_handle, port_state->sda_pin_current,
-             port_state->scl_pin_current, port_state->ref_count);
+             port_state->scl_pin_current);
 
     xSemaphoreGive(port_state->lock);
     return ESP_OK;
