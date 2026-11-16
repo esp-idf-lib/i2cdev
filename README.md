@@ -174,7 +174,7 @@ them is the caller's job before `i2cdev_done()` is called.
 | `i2cdev_get_shared_handle()` | Bus handle for native ESP-IDF components |
 
 The full description, with the return codes of every function, is in the
-[documentation](https://esp-idf-lib.github.io/i2cdev/group__i2cdev.html) and in
+[documentation](https://esp-idf-lib.github.io/i2cdev/) and in
 `i2cdev.h`.
 
 ## Examples
@@ -190,10 +190,11 @@ idf.py add-dependency esp-idf-lib/i2cdev
 
 ## Support
 
-* [Issues](https://github.com/esp-idf-lib/i2cdev/issues)
-* [Discussions and questions](https://github.com/esp-idf-lib/core/discussions)
+For questions and discussions about the component, please use
+[Discussions](https://github.com/esp-idf-lib/core/discussions)
+at [esp-idf-lib/core](https://github.com/esp-idf-lib/core).
 
 ## Contributing
 
-Please read [CONTRIBUTING.md](https://github.com/esp-idf-lib/.github/blob/main/CONTRIBUTING.md)
-and [CODE_OF_CONDUCT.md](https://github.com/esp-idf-lib/.github/blob/main/CODE_OF_CONDUCT.md).
+Please read [CONTRIBUTING.md](https://github.com/esp-idf-lib/core/blob/main/CONTRIBUTING.md)
+at [esp-idf-lib/core](https://github.com/esp-idf-lib/core).
