@@ -1,5 +1,5 @@
 ---
-version: 2.2.1
+version: 2.2.2
 description: ESP-IDF I2C master thread-safe utilities
 license: MIT
 dependencies:
