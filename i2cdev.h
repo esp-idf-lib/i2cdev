@@ -20,34 +20,29 @@
  *
  * MIT Licensed as described in the file LICENSE
  *
- * ============================================================================
- * OPTIONAL I2C PULLUP AUTO-CONFIGURATION
- * ============================================================================
+ * @par Internal pullups
+ * The i2c_master based implementation can turn on the internal pullups when
+ * the descriptor does not ask for them explicitly: with
+ * @c CONFIG_I2CDEV_AUTO_ENABLE_PULLUPS enabled and both @c sda_pullup_en and
+ * @c scl_pullup_en left at zero, the pins are configured with the internal
+ * pullups. The option is off by default, because a board with external
+ * resistors does not need them, and the legacy implementation ignores it
+ * altogether: there the two flags are the only source of that setting.
  *
- * This library can optionally enable internal I2C pullups when no explicit
- * pullup configuration is provided. Feature is DISABLED by default for
- * backward compatibility (CONFIG_I2CDEV_AUTO_ENABLE_PULLUPS=n).
- *
- * Optional auto-pullup (CONFIG_I2CDEV_AUTO_ENABLE_PULLUPS=y):
- * - If both pullup flags are false (not set/default state), automatically enables internal pullups
- * - Implemented by the i2c_master based driver only (i2cdev.c), on any target
- * - Legacy driver always uses explicit configuration
- *
- *
- * Example - Enable internal pullups:
+ * The explicit form works in both implementations:
+ * @code{.c}
  * i2c_dev_t sensor = {
  *     .port = I2C_NUM_0,
  *     .addr = 0x48,
  *     .cfg = {
  *         .sda_io_num = GPIO_NUM_21,
  *         .scl_io_num = GPIO_NUM_22,
- *         .sda_pullup_en = true,  // Enable internal pullups
- *         .scl_pullup_en = true,  // Enable internal pullups
+ *         .sda_pullup_en = true,  // internal pullup on SDA
+ *         .scl_pullup_en = true,  // internal pullup on SCL
  *         .master.clk_speed = 400000
  *     }
  * };
- *
- * ============================================================================
+ * @endcode
  */
 
 #ifndef __I2CDEV_H__
@@ -464,7 +459,8 @@ esp_err_t i2c_dev_write_reg(const i2c_dev_t *dev, uint8_t reg, const void *data,
  * 3. Call this function to retrieve the bus handle
  * 4. Pass the handle to ESP-IDF components (e.g., esp_lcd_new_panel_io_i2c)
  *
- * @note USAGE EXAMPLE:
+ * @par Usage example
+ * @code{.c}
  * // 1. Initialize i2cdev
  * i2cdev_init();
  *
@@ -510,6 +506,7 @@ esp_err_t i2c_dev_write_reg(const i2c_dev_t *dev, uint8_t reg, const void *data,
  * // I2C_DEV_TAKE_MUTEX()/I2C_DEV_GIVE_MUTEX(), and the external component
  * // serialises its own device handle. Delete the external device before
  * // i2cdev_done(): i2cdev does not track it and cannot remove it from the bus.
+ * @endcode
  *
  * @param port I2C port number (e.g., I2C_NUM_0)
  * @param[out] bus_handle Pointer to store the bus handle
